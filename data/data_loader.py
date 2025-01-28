@@ -18,7 +18,7 @@ def download_data(data_cache_dir, device_name):
         f.extractall(data_cache_dir)
 
 
-def prepare_datasets(args):
+def prepare_datasets(args, device_list, workers):
 
     train_data_local_dict = {}
     test_data_local_dict = {}
