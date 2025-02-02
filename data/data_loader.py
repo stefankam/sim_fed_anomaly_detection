@@ -27,7 +27,7 @@ def prepare_datasets(args, device_list, workers):
     test_data_num = 0
 
     # Normalize dataset using pre-calculated min/max
-    min_max_file_path = "./data"
+    min_max_file_path = "/Users/stefanbehfar/Documents/Projects/FedML/iot/anomaly_detection_for_cybersecurity/data"
     min_dataset = np.loadtxt(os.path.join(min_max_file_path, "min_dataset.txt"))
     max_dataset = np.loadtxt(os.path.join(min_max_file_path, "max_dataset.txt"))
 

@@ -3,17 +3,26 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 import torch
+import torch.nn as nn
+from sklearn.metrics import precision_score, recall_score, f1_score
+from sklearn.metrics import precision_recall_curve
+from model.autoencoder import AutoEncoder
+from sklearn.preprocessing import StandardScaler
+import numpy as np
+import os
 
 
 # Visualize Reconstruction Loss Distributions
-def plot_reconstruction_loss(global_model, workers, data_key="value"):
+def plot_reconstruction_loss(global_model, global_scaler, workers, data_key="value"):
     import torch.nn as nn
     criterion = nn.MSELoss()
     losses = []
     for worker in workers:
         data = worker.client_cache.get('data_key')
         features = data["test"]["features"]  # Or use a separate test key if available
-        features = (features - features.min()) / (features.max() - features.min())
+        # **Use global scaler**
+        features = global_scaler.transform(features)
+        features = torch.tensor(features, dtype=torch.float32)
 
         # Forward pass
         global_model.eval()
@@ -39,7 +48,7 @@ def plot_reconstruction_loss(global_model, workers, data_key="value"):
 
 
 # Compare Local and Global Model Performance
-def evaluate_local_and_global(global_model, workers, data_key="value"):
+def evaluate_local_and_global(global_model, global_scaler, workers, data_key="value"):
     import torch.nn as nn
     global_criterion = nn.MSELoss()
     results = []
@@ -47,7 +56,9 @@ def evaluate_local_and_global(global_model, workers, data_key="value"):
     for worker in workers:
         data = worker.client_cache.get('data_key')
         features = data["test"]["features"]
-        features = (features - features.min()) / (features.max() - features.min())
+        # **Use global scaler**
+        features = global_scaler.transform(features)
+        features = torch.tensor(features, dtype=torch.float32)
 
         # Global model evaluation
         global_model.eval()
@@ -56,7 +67,7 @@ def evaluate_local_and_global(global_model, workers, data_key="value"):
             global_loss = global_criterion(global_reconstructed, features).item()
 
         # Local model evaluation
-        local_state = worker.client_cache.get("value")
+        local_state = worker.client_cache.get('local_value')
         local_autoencoder = AutoEncoder(output_dim=features.shape[1])
         local_autoencoder.load_state_dict(local_state)
         local_autoencoder.eval()
@@ -93,7 +104,7 @@ def generate_report(global_loss, local_global_comparison):
 
 
 
-def define_threshold(global_model, workers, data_key="value"):
+def define_threshold(global_model, global_scaler, workers, data_key="value"):
     """
     Define anomaly detection threshold using reconstruction errors on benign traffic.
     """
@@ -102,8 +113,10 @@ def define_threshold(global_model, workers, data_key="value"):
 
     for worker in workers:
         data = worker.client_cache.get('data_key')
-        features = data["test"]["features"][data["test"]["labels"] == 0]  # Benign samples (label=0)
-        features = (features - features.min()) / (features.max() - features.min())
+        features = data['train']['features']
+        # **Use global scaler**
+        features = global_scaler.transform(features)
+        features = torch.tensor(features, dtype=torch.float32)
 
         # Forward pass
         global_model.eval()
@@ -114,14 +127,62 @@ def define_threshold(global_model, workers, data_key="value"):
 
     # Threshold based on mean + 3 * std of benign reconstruction errors
     benign_errors = torch.tensor(benign_errors)
-    threshold = benign_errors.mean().item() + 3 * benign_errors.std().item()
+    threshold = benign_errors.mean().item() + 1 * benign_errors.std().item()
     print(f"Defined Threshold: {threshold:.4f}")
     return threshold
 
 
-from sklearn.metrics import precision_score, recall_score, f1_score
+def get_threshold_global(global_model, args, device_list):
+    th_local_dict = dict()
+    min_max_file_path = "/Users/stefanbehfar/Documents/Projects/FedML/iot/anomaly_detection_for_cybersecurity/data"
+    min_dataset = np.loadtxt(os.path.join(min_max_file_path, "min_dataset.txt"))
+    max_dataset = np.loadtxt(os.path.join(min_max_file_path, "max_dataset.txt"))
 
-def evaluate_anomalies(global_model, workers, threshold, data_key="value"):
+    for i, device_name in enumerate(device_list):
+        benign_data = pd.read_csv(
+            os.path.join(args.data_cache_dir, device_name, "benign_traffic.csv")
+        ).values  # Convert DataFrame to NumPy
+
+        benign_th = benign_data[5000:8000]
+        benign_th[np.isnan(benign_th)] = 0  # Replace NaNs with 0
+
+        # Avoid division by zero in normalization
+        benign_th = (benign_th - min_dataset) / (max_dataset - min_dataset + 1e-8)
+
+        # Ensure correct dtype for PyTorch
+        benign_th = torch.tensor(benign_th, dtype=torch.float32)
+
+        th_local_dict[i] = torch.utils.data.DataLoader(
+            benign_th, batch_size=128, shuffle=False, num_workers=0
+        )
+
+    model = global_model
+    model.eval()
+
+    mse = []
+    threshold_func = nn.MSELoss(reduction="none")
+
+    for client_index, train_data in th_local_dict.items():
+        for batch_idx, x in enumerate(train_data):
+            x = x.to(torch.float32)  # Ensure float32 consistency
+            with torch.no_grad():  # Avoid gradient tracking
+                diff = threshold_func(model(x), x)
+            mse.append(diff)
+
+    if len(mse) == 0:
+        raise ValueError("No MSE values were computed. Check your DataLoader.")
+
+    # Concatenate tensors safely
+    mse_global = torch.cat(mse, dim=0).mean(dim=1)
+
+    # Compute threshold (Mean + 3 * StdDev)
+    threshold_global = torch.mean(mse_global) + 3 * torch.std(mse_global)
+
+    return threshold_global
+
+
+
+def evaluate_anomalies(global_model, global_scaler, workers, threshold, data_key="value"):
     """
     Evaluate detection of anomalies based on the defined threshold.
     """
@@ -132,7 +193,9 @@ def evaluate_anomalies(global_model, workers, threshold, data_key="value"):
         data = worker.client_cache.get('data_key')
         features = data["test"]["features"]
         labels = data["test"]["labels"]  # Ground truth labels
-        features = (features - features.min()) / (features.max() - features.min())
+        # **Use global scaler**
+        features = global_scaler.transform(features)
+        features = torch.tensor(features, dtype=torch.float32)
 
         # Forward pass
         global_model.eval()
@@ -157,10 +220,9 @@ def evaluate_anomalies(global_model, workers, threshold, data_key="value"):
     return precision, recall, f1
 
 
-from sklearn.metrics import precision_recall_curve
-import numpy as np
 
-def plot_error_distributions(global_model, workers, threshold, data_key="value"):
+
+def plot_error_distributions(global_model, global_scaler, workers, threshold, data_key="value"):
     """
     Plot reconstruction error distributions for benign and attack samples.
     """
@@ -171,7 +233,9 @@ def plot_error_distributions(global_model, workers, threshold, data_key="value")
         data = worker.client_cache.get('data_key')
         features = data["test"]["features"]
         labels = data["test"]["labels"]
-        features = (features - features.min()) / (features.max() - features.min())
+        # **Use global scaler**
+        features = global_scaler.transform(features)
+        features = torch.tensor(features, dtype=torch.float32)
 
         # Forward pass
         global_model.eval()
@@ -187,6 +251,10 @@ def plot_error_distributions(global_model, workers, threshold, data_key="value")
     plt.hist(benign_errors, bins=50, alpha=0.7, label="Benign")
     plt.hist(attack_errors, bins=50, alpha=0.7, label="Attack")
     plt.axvline(x=threshold, color="red", linestyle="--", label="Threshold")
+
+    # Set x-axis limit to 20
+    plt.xlim(0, 20)
+
     plt.xlabel("Reconstruction Error")
     plt.ylabel("Frequency")
     plt.title("Reconstruction Error Distribution")
@@ -194,8 +262,7 @@ def plot_error_distributions(global_model, workers, threshold, data_key="value")
     plt.show()
 
 
-
-def plot_precision_recall(global_model, workers, data_key="value"):
+def plot_precision_recall(global_model, global_scaler, workers, data_key="value"):
     """
     Plot the precision-recall curve to visualize detection performance.
     """
@@ -206,7 +273,9 @@ def plot_precision_recall(global_model, workers, data_key="value"):
         data = worker.client_cache.get('data_key')
         features = data["test"]["features"]
         labels = data["test"]["labels"]
-        features = (features - features.min()) / (features.max() - features.min())
+        # **Use global scaler**
+        features = global_scaler.transform(features)
+        features = torch.tensor(features, dtype=torch.float32)
 
         # Forward pass
         global_model.eval()
