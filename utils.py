@@ -4,7 +4,7 @@ import pandas as pd
 import seaborn as sns
 import torch
 import torch.nn as nn
-from sklearn.metrics import precision_score, recall_score, f1_score
+from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
 from sklearn.metrics import precision_recall_curve
 from model.autoencoder import AutoEncoder
 from sklearn.preprocessing import StandardScaler
@@ -210,14 +210,16 @@ def evaluate_anomalies(global_model, global_scaler, workers, threshold, data_key
         y_pred.extend(predictions.tolist())
 
     # Compute metrics
+    accuracy = accuracy_score(y_true, y_pred)
     precision = precision_score(y_true, y_pred)
     recall = recall_score(y_true, y_pred)
     f1 = f1_score(y_true, y_pred)
 
+    print(f"Accuracy: {accuracy:.4f}")
     print(f"Precision: {precision:.4f}")
     print(f"Recall: {recall:.4f}")
     print(f"F1 Score: {f1:.4f}")
-    return precision, recall, f1
+    return accuracy, precision, recall, f1
 
 
 
@@ -295,3 +297,74 @@ def plot_precision_recall(global_model, global_scaler, workers, data_key="value"
     plt.ylabel("Precision")
     plt.title("Precision-Recall Curve")
     plt.show()
+
+
+def tune_threshold(global_model, global_scaler, workers, num_thresholds=100, data_key='data_key'):
+    """
+    Evaluate reconstruction errors over all workers and choose a threshold that
+    maximizes the F1 score.
+
+    Args:
+        global_model: The trained global autoencoder.
+        global_scaler: The scaler used for normalizing features.
+        workers: A list of worker objects (each with a client_cache containing test data).
+        num_thresholds: The number of candidate thresholds to test.
+        data_key: The key to access the data from each worker's cache.
+
+    Returns:
+        best_threshold: The threshold value that gave the best F1 score.
+        best_metrics: A tuple (precision, recall, f1) at the best threshold.
+    """
+    global_model.eval()
+    all_errors = []
+    all_labels = []
+
+    # Collect errors and labels from all workers
+    for worker in workers:
+        data = worker.client_cache.get(data_key)
+        features = data["test"]["features"]
+        labels = data["test"]["labels"]
+
+        # Normalize using the provided global scaler
+        features = global_scaler.transform(features)
+        features = torch.tensor(features, dtype=torch.float32)
+
+        with torch.no_grad():
+            reconstructed = global_model(features)
+            # Calculate the per-sample reconstruction error (MSE)
+            errors = ((reconstructed - features) ** 2).mean(dim=1).cpu().numpy()
+
+        all_errors.extend(errors)
+        all_labels.extend(labels)
+
+    all_errors = np.array(all_errors)
+    all_labels = np.array(all_labels)
+
+    # Define a range of thresholds to try (from min to max observed error)
+    min_error = all_errors.min()
+    max_error = all_errors.max()
+    thresholds = np.linspace(min_error, max_error, num=num_thresholds)
+
+    best_threshold = None
+    best_f1 = 0.0
+    best_metrics = (0, 0, 0)
+
+    # Grid search for the best threshold
+    for th in thresholds:
+        # Predict attack if reconstruction error is greater than threshold
+        preds = (all_errors > th).astype(int)
+
+        accuracy = accuracy_score(all_labels, preds)
+        precision = precision_score(all_labels, preds, zero_division=0)
+        recall = recall_score(all_labels, preds, zero_division=0)
+        f1 = f1_score(all_labels, preds, zero_division=0)
+
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = th
+            best_metrics = (accuracy, precision, recall, f1)
+
+    print(f"Best threshold: {best_threshold:.4f}")
+    print(f"Accuracy: {best_metrics[0]:.4f}, Precision: {best_metrics[1]:.4f}, Recall: {best_metrics[2]:.4f}, F1 Score: {best_metrics[3]:.4f}")
+
+    return best_threshold, best_metrics

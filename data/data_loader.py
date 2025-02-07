@@ -20,11 +20,11 @@ def download_data(data_cache_dir, device_name):
 
 def prepare_datasets(args, device_list, workers):
 
-    train_data_local_dict = {}
-    test_data_local_dict = {}
-    train_data_local_num_dict = {}
-    train_data_num = 0
-    test_data_num = 0
+    benign_data_local_dict = {}
+    attack_data_local_dict = {}
+    benign_data_local_num_dict = {}
+    benign_data_num = 0
+    attack_data_num = 0
 
     # Normalize dataset using pre-calculated min/max
     min_max_file_path = "/Users/stefanbehfar/Documents/Projects/FedML/iot/anomaly_detection_for_cybersecurity/data"
@@ -49,7 +49,7 @@ def prepare_datasets(args, device_list, workers):
         benign_data = pd.read_csv(
             os.path.join(device_data_cache_dir, "benign_traffic.csv")
         )
-        benign_data = benign_data[:5000].fillna(0).to_numpy()
+        benign_data = benign_data.fillna(0).to_numpy()
         benign_data = (benign_data - min_dataset) / (max_dataset - min_dataset)
 
         # Load attack data
@@ -69,11 +69,16 @@ def prepare_datasets(args, device_list, workers):
             ]
             attack_data_files.extend(mirai_attack_files)
 
+        # Load attack data
         attack_data = pd.concat(
-            [pd.read_csv(f).fillna(0).iloc[:500] for f in attack_data_files]
+            [pd.read_csv(f).fillna(0) for f in attack_data_files]
         )
         attack_data = (attack_data - attack_data.mean()) / (attack_data.std())
         attack_data = attack_data.to_numpy()
+
+        # Split attack data among workers
+        attack_splits = np.array_split(attack_data, len(workers))
+        attack_data = attack_splits[i]  # Each worker gets a unique subset
 
         # Create DataLoader objects
         benign_loader = torch.utils.data.DataLoader(
@@ -85,24 +90,24 @@ def prepare_datasets(args, device_list, workers):
 
         # Store datasets in worker's client cache
         worker.client_cache.update(
-            value={"train": benign_loader, "test": attack_loader},
+            value={"benign": benign_loader, "attack": attack_loader},
             description=f"Local dataset for {device_name}",
         )
 
         # Update statistics
-        train_data_local_dict[i] = benign_loader
-        test_data_local_dict[i] = attack_loader
-        train_data_local_num_dict[i] = len(benign_loader)
-        train_data_num += len(benign_loader)
-        test_data_num += len(attack_loader)
+        benign_data_local_dict[i] = benign_loader
+        attack_data_local_dict[i] = attack_loader
+        benign_data_local_num_dict[i] = len(benign_loader)
+        benign_data_num += len(benign_loader)
+        attack_data_num += len(attack_loader)
 
     # Return dataset statistics for analysis
     dataset = {
-        "train_data_num": train_data_num,
-        "test_data_num": test_data_num,
-        "train_data_local_dict": train_data_local_dict,
-        "test_data_local_dict": test_data_local_dict,
-        "train_data_local_num_dict": train_data_local_num_dict,
+        "benign_data_num": benign_data_num,
+        "attack_data_num": attack_data_num,
+        "benign_data_local_dict": benign_data_local_dict,
+        "attack_data_local_dict": attack_data_local_dict,
+        "benign_data_local_num_dict": benign_data_local_num_dict,
         "class_num": 115,
     }
     return dataset
