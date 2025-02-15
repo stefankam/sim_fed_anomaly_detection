@@ -3,7 +3,7 @@ import sys
 import argparse
 import numpy as np
 import subprocess
-
+import re
 sys.path.append("/home/sim_fed_anomaly_detection")
 from sklearn.preprocessing import StandardScaler
 
@@ -22,8 +22,9 @@ from torch import nn
 from sklearn.model_selection import train_test_split
 from data.data_loader import prepare_datasets
 
+from mininet.cli import CLI
 from mininet.net import Mininet
-from mininet.node import Host, OVSController, OVSSwitch
+from mininet.node import Host,  OVSController, OVSSwitch
 from mininet.link import TCLink
 import math
 import psutil
@@ -32,14 +33,19 @@ import matplotlib.pyplot as plt
 import threading
 from tabulate import tabulate
 
+class CustomHost(Host):
+    def __init__(self, name, *args, **kwargs):
+        super().__init__(name, *args, **kwargs)
+        # Custom attribute for client cache
+        self.client_cache = {}
 
 class TopologyProvider:
     def __init__(self, device_names, num_workers, workers, link_latency=None, link_loss=None):
         self.device_names = device_names
         self.num_workers = num_workers
-        self.workers = workers
         self.link_latency = link_latency
         self.link_loss = link_loss
+        self.workers = workers
         self.latency_data = []
         self.packet_loss_data = []
         self.throughput_data = []
@@ -63,50 +69,72 @@ class TopologyProvider:
         self.switch_num += 1
         return self.net.addSwitch(name)
 
-    def add_worker(self, device, index):
+    def add_worker(self, device, index, *args, **kwargs):
+        if not hasattr(self, "net") or self.net is None:
+            raise ValueError("Mininet instance (self.net) is not initialized. Call setup() first.")
         worker_name = f"{device}_{index + 1}"
         self.host_num += 1
-        return self.net.addHost(worker_name, cls=CustomHost)
+        # Assign a unique IP address dynamically
+        ip_address = f"10.0.0.{self.host_num}"  # Start from 10.0.0.1, 10.0.0.2, etc.
+        # Create the host with the given IP address and other parameters
+        host = self.net.addHost(worker_name, cls=CustomHost, ip=ip_address, **kwargs)
+
+        return host
 
     def monitor_latency_packet_loss(self, host):
         """Ping a host to measure latency and packet loss."""
         try:
-            result = subprocess.run(["ping", "-c", "5", host.IP()], capture_output=True, text=True)
-            output = result.stdout
+            output = host.cmd(f"ping -c 5 {host.IP()}")
+            print("host.name: ", host.name)
+            print("host.IP: ", host.IP())
             print("ping output: ", output)
-            loss_index = output.find("packet loss")
-            latency_index = output.find("rtt min/avg/max/mdev")
+            # Extract packet loss
+            loss_match = re.search(r'(\d+)% packet loss', output)
+            loss = float(loss_match.group(1)) if loss_match else None
+            # Extract latency (min/avg/max/mdev)
+            latency_match = re.search(r'rtt min/avg/max/mdev = ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)', output)
+            latency = float(latency_match.group(2)) if latency_match else None  # Extract avg latency
+            if loss is not None:
+               self.packet_loss_data.append(loss)
+            if latency is not None:
+               self.latency_data.append(latency)
 
-            if loss_index != -1 and latency_index != -1:
-                loss = float(output[loss_index - 5: loss_index].strip().split('%')[0])
-                print("loss: ", loss)
-                latency = float(output.split("/")[4])
-                print("latency: ", latency)
-                self.latency_data.append(latency)
-                self.packet_loss_data.append(result.count('Unreachable') / 5.0 * 100)
-                print(f"Latency: {latency} ms, Packet Loss: {loss}%")
+            print(f"Latency: {latency} ms, Packet Loss: {loss}%")
+        
         except Exception as e:
             print(f"Error monitoring latency: {e}")
 
     def start_iperf(self, host):
         """Measure network throughput using iperf."""
-        subprocess.Popen(["iperf", "-s"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(2)
-        result = subprocess.run(["iperf", "-c", host.name, "-t", "5"], capture_output=True, text=True)
-        output = result.stdout
+        # Start iperf server on the host using host.cmd()
+        print(f"Starting iperf server on {host.name}")
+        host.cmd("iperf -s &")
+        time.sleep(2)  # Give time for the server to start
 
-        # Get the server's IP address
-        server_ip = host.IP()
-        if not server_ip:
-            print("⚠️ Error: Could not retrieve IP for iperf server!")
-            return
-        print(f"📡 Starting iperf server on {host.name} ({server_ip})...")
+        # Run the iperf client on another host
+        print(f"Running iperf client from {host.name}")
+        result = host.cmd(f"iperf -c {host.IP()} -t 5")
 
-        if "Mbits/sec" in output:
-            throughput = float(output.split("Mbits/sec")[0].split()[-1])
+        # Print the raw output for debugging
+        print(f"Raw iperf output:\n{result}")
+        
+        # Parse the output to get throughput
+        # Check for different units in the output
+        for line in result.splitlines():
+            if "Mbits/sec" in line:
+                throughput = float(line.split("Mbits/sec")[0].split()[-1])
+                throughput_unit = "Mbits/sec"
+                break
+            elif "Gbits/sec" in line:
+                throughput = float(line.split("Gbits/sec")[0].split()[-1]) * 1000  # Convert Gbits/sec to Mbits/sec
+                throughput_unit = "Gbits/sec"
+                break
+        if throughput is not None:
             self.throughput_data.append(throughput)
-            print(f"Throughput: {throughput} Mbits/sec")
-
+            print(f"Throughput: {throughput} Mbits/sec (from {throughput_unit})")
+        else:
+            print("Error: Could not parse iperf output.")
+    
     def monitor_resources(self):
         """Monitor system resource usage."""
         cpu = psutil.cpu_percent(interval=1)
@@ -115,7 +143,7 @@ class TopologyProvider:
         self.timestamps.append(time.time())
         print(f"CPU Usage: {cpu}%")
         print(f"Memory Usage: {memory.percent}%")
-
+    
     def generate_report(self):
         """Generate a report with latency, throughput, and resource usage graphs."""
         plt.figure(figsize=(10, 5))
@@ -134,25 +162,26 @@ class TopologyProvider:
         plt.tight_layout()
         plt.show()
 
+
     def generate_table(self):
         # Extract CPU and Memory usage data
         cpu_usage = [cpu for cpu, _ in self.resource_data]
         memory_usage = [mem.percent for _, mem in self.resource_data]
-
+        
         def safe_stats(data):
             """Returns min, max, and average safely even if the data is empty."""
             if not data:
                 return "N/A", "N/A", "N/A"
-            return min(data), max(data), sum(data) / len(data)
+            return min(data), max(data), sum(data)/len(data)
 
         # Prepare report data with safe checks
         report_data = [
-            ["Metric", "Min", "Max", "Average"],
-            ["Latency (ms)", *safe_stats(self.latency_data)],
-            ["Packet Loss (%)", *safe_stats(self.packet_loss_data)],
-            ["Throughput (Mbps)", *safe_stats(self.throughput_data)],
-            ["CPU Usage (%)", *safe_stats(cpu_usage)],
-            ["Memory Usage (%)", *safe_stats(memory_usage)],
+        ["Metric", "Min", "Max", "Average"],
+        ["Latency (ms)", *safe_stats(self.latency_data)],
+        ["Packet Loss (%)", *safe_stats(self.packet_loss_data)],
+        ["Throughput (Mbps)", *safe_stats(self.throughput_data)],
+        ["CPU Usage (%)", *safe_stats(cpu_usage)],
+        ["Memory Usage (%)", *safe_stats(memory_usage)],
         ]
 
         print(tabulate(report_data, headers="firstrow", tablefmt="grid"))
@@ -180,38 +209,23 @@ class TopologyProvider:
         self.net.start()
         print("✅ Mininet started successfully!")
 
-        # Monitor resources and start iperf after the network is started
-        self.monitor_resources()
-        self.start_iperf(worker)
-        self.monitor_latency_packet_loss(worker)
+        # After the network is started, start iperf tests for each worker
+        for worker in self.workers:
+           self.start_iperf(worker)
+           self.monitor_resources()
+           self.monitor_latency_packet_loss(worker)
+
         return self.net
 
-
-class CustomHost(Host):
-    def __init__(self, name, *args, **kwargs):
-        super().__init__(name, *args, **kwargs)
-        self.client_cache = {}  # Custom attribute
-
-    def config(self, **kwargs):
-        """Ensure IP assignment after host initialization."""
-        super().config(**kwargs)
-
-        # Assign a static IP based on the host number (last digit in name)
-        host_number = ''.join(filter(str.isdigit, self.name))  # Extract number from name
-        if host_number:
-            ip_address = f"10.0.0.{host_number}"
-            self.setIP(ip_address)  # Assign IP
-            print(f"✅ Assigned IP {ip_address} to {self.name}")
-        return self
 
 
 # Define devices and number of workers
 device_names = ["Doorbell", "Thermost"]
-num_workers = 1  # Each device gets 5 workers
-
-# Create the topology# Generate correctly numbered workers per device
+num_workers = 1  
+link_latency = 2
+link_loss = 0.01
 workers = []
-topology = TopologyProvider(device_names, num_workers, workers)
+topology = TopologyProvider(device_names, num_workers, workers, link_latency, link_loss)
 
 # Setup and start Mininet
 net = topology.setup()
@@ -227,7 +241,7 @@ args, unknown = parser.parse_known_args()  # Ignores PyCharm-specific args
 # Prepare Datasets (only run once)
 args.data_cache_dir = "/home/sim_fed_anomaly_detection/data_cache"
 args.batch_size = 2
-# prepare_datasets(args, device_names, workers)
+#prepare_datasets(args, device_names, workers)
 
 # Container to hold training features from all workers
 all_train_features = []
@@ -248,8 +262,7 @@ for worker in workers:
     data = {"train": {"features": X_train, "labels": y_train}, "test": {"features": X_test, "labels": y_test}}
     worker.client_cache.update(data_key=data)
 
-    print(
-        f"[{worker.name}] X_train {len(X_train)}, X_test: {len(X_test)}, Y_train {len(y_train)}, y_test {len(y_test)}")
+    print(f"[{worker.name}] X_train {len(X_train)}, X_test: {len(X_test)}, Y_train {len(y_train)}, y_test {len(y_test)}")
 
     benign_train = (y_train == 0).sum().item()
     attack_train = (y_train == 1).sum().item()
@@ -261,12 +274,10 @@ for worker in workers:
     print(f"{worker.name} - TRAIN: Total {total_train} (Benign: {benign_train}, Attack: {attack_train})")
     print(f"{worker.name} - TEST: Total {total_test} (Benign: {benign_test}, Attack: {attack_test})")
 
+
 all_features = np.vstack([worker.client_cache.get('data_key')['train']['features'] for worker in workers])
 global_scaler = StandardScaler().fit(all_features)
 
-link_latency = 2
-link_loss = 0.01
-TP = TopologyProvider(device_names, num_workers, link_latency, link_loss)
 
 
 # Train AutoEncoders
@@ -275,7 +286,7 @@ def train_local_autoencoder(worker_model, worker, output_dim=115, epochs=5, lr=0
     data = worker.client_cache.get('data_key')
 
     features = data['train']['features']
-    # features = (features - features.min()) / (features.max() - features.min())
+    #features = (features - features.min()) / (features.max() - features.min())
     # **Use global scaler**
     features = global_scaler.transform(features)
     features = torch.tensor(features, dtype=torch.float32)
@@ -289,6 +300,7 @@ def train_local_autoencoder(worker_model, worker, output_dim=115, epochs=5, lr=0
     criterion = torch.nn.MSELoss()
     optimizer = torch.optim.Adam(autoencoder.parameters(), lr=lr)
 
+  
     # Training loop
     for epoch in range(epochs):
         epoch_loss = 0
@@ -307,7 +319,7 @@ def train_local_autoencoder(worker_model, worker, output_dim=115, epochs=5, lr=0
             epoch_loss += loss.item()
         # Call monitor_resources periodically (e.g., every few epochs)
         if epoch % 5 == 0:  # Call every 5 epochs
-            TP.monitor_resources()
+            topology.monitor_resources()
         print(f"[{worker.name}] Epoch {epoch + 1}/{epochs}, Loss: {epoch_loss / len(dataloader):.4f}")
 
     # Save the trained model parameters
@@ -315,7 +327,7 @@ def train_local_autoencoder(worker_model, worker, output_dim=115, epochs=5, lr=0
         local_value=autoencoder.state_dict(),
         description=f"Trained AutoEncoder for {worker.name}",
     )
-    return autoencoder.state_dict(), epoch_loss / len(dataloader)
+    return autoencoder.state_dict(), epoch_loss/len(dataloader)
 
 
 # Aggregate Updates to perform weighted averaging based on the number of samples from each worker
@@ -324,8 +336,7 @@ def aggregate_updates(local_updates, global_model, local_sample_counts):
     total_samples = sum(local_sample_counts)
 
     for key in state_dict.keys():
-        weighted_sum = sum(
-            local_updates[i][key] * (local_sample_counts[i] / total_samples) for i in range(len(local_updates)))
+        weighted_sum = sum(local_updates[i][key] * (local_sample_counts[i] / total_samples) for i in range(len(local_updates)))
         state_dict[key] = weighted_sum
 
     return state_dict
@@ -341,7 +352,7 @@ def evaluate_global_model(global_model, workers):
         if data is None:
             raise ValueError(f"No data found for {worker.name}")
         features = data["test"]["features"]  # Or use a separate test key if available
-        # features = (features - features.min()) / (features.max() - features.min())
+        #features = (features - features.min()) / (features.max() - features.min())
         # **Use global scaler**
         features = global_scaler.transform(features)
         features = torch.tensor(features, dtype=torch.float32)
@@ -397,14 +408,13 @@ for round_num in range(1, num_rounds + 1):
         worker_state_before = worker_model.state_dict()  # Save initial state
 
         # **Train the local model and get loss**
-        _, local_loss = train_local_autoencoder(worker_model, worker, output_dim=output_dim, epochs=epochs_per_round,
-                                                lr=lr)
+        _,local_loss = train_local_autoencoder(worker_model, worker, output_dim=output_dim, epochs=epochs_per_round, lr=lr)
         local_losses.append(local_loss)  # Store the local loss
 
         worker_state_after = worker_model.state_dict()  # Get trained state
 
         # Compute model update (delta)
-        # model_update = {k: worker_state_after[k] - worker_state_before[k] for k in worker_state_before}
+        #model_update = {k: worker_state_after[k] - worker_state_before[k] for k in worker_state_before}
         model_update = {k: worker_state_after[k].detach().clone() - worker_state_before[k].detach().clone()
                         for k in worker_state_before}
         local_updates.append(model_update)
@@ -416,7 +426,7 @@ for round_num in range(1, num_rounds + 1):
     global_autoencoder.load_state_dict(global_state)
 
     # Compute global loss (optional: use a test dataset)
-    global_loss = evaluate_global_model(global_autoencoder, workers)
+    global_loss = evaluate_global_model(global_autoencoder,workers)
 
     # Store losses for plotting
     global_losses.append(global_loss)
@@ -428,6 +438,7 @@ for round_num in range(1, num_rounds + 1):
         avg_local_loss = 0.0  # Default value
 
     print(f"Round {round_num}: Global Loss = {global_loss:.4f}, Avg Local Loss = {avg_local_loss:.4f}")
+
 
 evaluate_global_model(global_autoencoder, workers)
 
@@ -444,8 +455,9 @@ local_global_comparison = evaluate_local_and_global(global_autoencoder, global_s
 print("\nGenerating final report...")
 generate_report(global_avg_loss, local_global_comparison)
 
+
 threshold = define_threshold(global_autoencoder, global_scaler, workers)
-# threshold = get_threshold_global(global_autoencoder, args, device_names)
+#threshold = get_threshold_global(global_autoencoder, args, device_names)
 accuracy, precision, recall, f1 = evaluate_anomalies(global_autoencoder, global_scaler, workers, threshold)
 plot_error_distributions(global_autoencoder, global_scaler, workers, threshold)
 plot_precision_recall(global_autoencoder, global_scaler, workers)
@@ -453,9 +465,8 @@ plot_precision_recall(global_autoencoder, global_scaler, workers)
 best_threshold, best_metrics = tune_threshold(global_autoencoder, global_scaler, workers, num_thresholds=100)
 plot_error_distributions(global_autoencoder, global_scaler, workers, best_threshold, data_key="data_key")
 
-TP.generate_report()
-TP.generate_table()
-
+topology.generate_report()
+topology.generate_table()
 
 def count_samples(loader):
     # Try to use the dataset attribute
@@ -476,7 +487,6 @@ def count_samples(loader):
             total += len(batch)
     return total
 
-
 # Example usage:
 for worker in workers:
     data = worker.client_cache.get('data_key')
@@ -493,4 +503,3 @@ for worker in workers:
     total = benign_count + attack_count
 
     print(f"{worker.name} - Total Samples: {total}, Benign: {benign_count}, Attack: {attack_count}")
-
